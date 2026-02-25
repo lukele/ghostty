@@ -1655,6 +1655,119 @@ pub const CAPI = struct {
         ptr.deinit();
     }
 
+    /// Dump VT-formatted screen content including SGR sequences for
+    /// colors and styles. This includes the current prompt/input line so
+    /// session restore behaves like macOS Terminal and preserves complete
+    /// transcript boundaries between launches.
+    ///
+    /// If the terminal is in alternate screen mode (e.g., vim, htop),
+    /// the primary screen is saved instead since alternate screen
+    /// content is ephemeral and useless after restart.
+    ///
+    /// The caller must free the result using ghostty_surface_free_text.
+    export fn ghostty_surface_dump_vt_screen(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const t = &core_surface.io.terminal;
+
+        // If the terminal is in alternate screen mode (vim, htop, etc.),
+        // save from the primary screen instead. Alternate screen content is
+        // ephemeral and not useful after restart.
+        const screen = if (t.screens.active_key == .alternate)
+            t.screens.get(.primary) orelse t.screens.active
+        else
+            t.screens.active;
+
+        var builder: std.Io.Writer.Allocating = .init(global.alloc);
+        defer builder.deinit();
+
+        var formatter: terminal.formatter.ScreenFormatter = .init(screen, .{
+            .emit = .vt,
+            .unwrap = false,
+            .trim = false,
+        });
+        formatter.content = .{ .selection = null };
+
+        formatter.format(&builder.writer) catch |err| {
+            log.warn("error dumping VT screen err={}", .{err});
+            return false;
+        };
+
+        const text = builder.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error allocating VT dump err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = text.ptr,
+            .text_len = text.len,
+        };
+
+        return true;
+    }
+
+    /// Replay VT-formatted content into a terminal's screen through
+    /// the readonly stream parser. This processes escape sequences
+    /// (SGR, cursor movement, etc.) to restore styled content.
+    /// After replaying, terminal modes are reset to safe defaults
+    /// to prevent mouse tracking, alt screen, etc. from persisting.
+    export fn ghostty_surface_replay_vt(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const t = &core_surface.io.terminal;
+
+        // Create a readonly stream to process VT sequences
+        var vt_stream = t.vtStream();
+        defer vt_stream.deinit();
+
+        // Feed the VT content through the parser
+        vt_stream.nextSlice(ptr[0..len]) catch |err| {
+            log.warn("error replaying VT content err={}", .{err});
+        };
+
+        // Reset potentially dangerous modes after replay.
+        // This prevents restored content from leaving the terminal
+        // in mouse tracking mode, alternate screen, etc.
+        t.modes.set(.mouse_event_x10, false);
+        t.modes.set(.mouse_event_normal, false);
+        t.modes.set(.mouse_event_button, false);
+        t.modes.set(.mouse_event_any, false);
+        t.modes.set(.mouse_format_sgr, false);
+        t.modes.set(.mouse_format_urxvt, false);
+        t.modes.set(.mouse_format_sgr_pixels, false);
+        t.modes.set(.bracketed_paste, false);
+        t.modes.set(.cursor_visible, true);
+
+        // Reset SGR style so the shell prompt starts clean
+        t.setAttribute(.{ .unset = {} }) catch {};
+    }
+
+    /// Returns true if the terminal cursor is currently in a semantic
+    /// prompt/input area (OSC 133 shell integration).
+    export fn ghostty_surface_cursor_at_prompt(
+        surface: *Surface,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+        return core_surface.io.terminal.cursorIsAtPrompt();
+    }
+
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();

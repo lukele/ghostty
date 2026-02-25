@@ -382,7 +382,14 @@ extension Ghostty {
             ) { [weak self] event in self?.localEventHandler(event) }
 
             // Setup our surface. This will also initialize all the terminal IO.
-            let surface_cfg = baseConfig ?? SurfaceConfiguration()
+            // Always set TERM_SESSION_ID so each surface has a stable UUID that
+            // persists across restarts. This enables /etc/bashrc_Apple_Terminal
+            // to handle per-session shell history and suppress duplicate login
+            // messages for restored sessions.
+            var surface_cfg = baseConfig ?? SurfaceConfiguration()
+            if surface_cfg.environmentVariables["TERM_SESSION_ID"] == nil {
+                surface_cfg.environmentVariables["TERM_SESSION_ID"] = self.id.uuidString
+            }
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -1721,6 +1728,152 @@ extension Ghostty {
             case uuid
             case title
             case isUserSetTitle
+            case scrollbackContent
+        }
+
+        /// Maximum number of bytes of scrollback content to save during state restoration.
+        private static let maxScrollbackSaveSize = 1_048_576 // 1MB
+
+        /// Read the screen content as VT-formatted text, preserving colors,
+        /// styles, and other SGR attributes.
+        private func readScreenContentVT() -> String? {
+            guard let surface = self.surface else { return nil }
+            var text = ghostty_text_s()
+            guard ghostty_surface_dump_vt_screen(surface, &text) else { return nil }
+            defer { ghostty_surface_free_text(surface, &text) }
+
+            guard let ptr = text.text else { return nil }
+            let content = String(cString: ptr)
+
+            // Truncate to the maximum save size, cutting from the beginning
+            // to keep the most recent content.
+            if content.utf8.count > Self.maxScrollbackSaveSize {
+                let startIndex = content.utf8.index(content.utf8.endIndex, offsetBy: -Self.maxScrollbackSaveSize)
+                // Find the next SGR reset after the cut point to avoid
+                // splitting an escape sequence.
+                let searchRange = content[startIndex...]
+                if let resetRange = searchRange.range(of: "\u{1b}[0m") {
+                    return "\u{1b}[0m" + String(content[resetRange.upperBound...])
+                }
+                if let newlineIndex = searchRange.firstIndex(of: "\n") {
+                    return "\u{1b}[0m" + String(content[content.index(after: newlineIndex)...])
+                }
+                return "\u{1b}[0m" + String(content[startIndex...])
+            }
+
+            // Trim trailing empty lines from the VT dump.
+            // The Zig side already excludes the prompt row(s).
+            var lines = content.components(separatedBy: "\r")
+            while let last = lines.last {
+                let plain = Self.csiPattern.stringByReplacingMatches(
+                    in: last,
+                    range: NSRange(last.startIndex..., in: last),
+                    withTemplate: ""
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                if plain.isEmpty {
+                    lines.removeLast()
+                } else {
+                    break
+                }
+            }
+            let trimmed = lines.joined(separator: "\r")
+            return trimmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : trimmed
+        }
+
+        /// Regex to strip CSI escape sequences for plain text extraction.
+        // swiftlint:disable:next force_try
+        private static let csiPattern = try! NSRegularExpression(
+            pattern: "\\x1b\\[[0-9;]*[A-Za-z]", options: []
+        )
+
+        /// Extract plain text "Last login:" and "Restored session:" lines
+        /// from the current screen. Captured before clearing so they can be
+        /// replayed after the [Restored] marker.
+        private func captureStartupBanners() -> String? {
+            guard let surface = self.surface else { return nil }
+            var text = ghostty_text_s()
+            guard ghostty_surface_dump_vt_screen(surface, &text) else { return nil }
+            defer { ghostty_surface_free_text(surface, &text) }
+            guard let ptr = text.text else { return nil }
+            let content = String(cString: ptr)
+
+            let lines = content.components(separatedBy: "\r")
+            var bannerLines: [String] = []
+            for line in lines {
+                let plain = Self.csiPattern.stringByReplacingMatches(
+                    in: line,
+                    range: NSRange(line.startIndex..., in: line),
+                    withTemplate: ""
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                if plain.hasPrefix("Last login:") || plain.hasPrefix("Restored session:") {
+                    bannerLines.append(plain)
+                }
+            }
+            guard !bannerLines.isEmpty else { return nil }
+            return bannerLines.joined(separator: "\r\n")
+        }
+
+        /// Replay VT-formatted scrollback content into the terminal screen,
+        /// preserving colors and styles. Adds a yellow restoration marker line.
+        /// After replaying, sends Enter to trigger a fresh prompt.
+        /// Wait for the shell's first prompt, then restore scrollback content
+        /// by writing it to a temp file and `cat`ing it through the pty.
+        /// This ensures content goes through the normal I/O path so the shell
+        /// tracks cursor position correctly and content survives resize.
+        private func waitForPromptThenReplay(_ content: String, attempt: Int = 0) {
+            let maxAttempts = 40 // ~2 seconds fallback
+            let delay: DispatchTimeInterval = attempt == 0 ? .milliseconds(150) : .milliseconds(50)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self else { return }
+                guard let surface = self.surface else {
+                    if attempt < maxAttempts {
+                        self.waitForPromptThenReplay(content, attempt: attempt + 1)
+                    }
+                    return
+                }
+
+                if ghostty_surface_cursor_at_prompt(surface) || attempt >= maxAttempts {
+                    // Capture startup banners as plain text before clearing
+                    let banners = self.captureStartupBanners()
+
+                    // Build the restore file content:
+                    // 1. Clear screen (ESC[2J ESC[H)
+                    // 2. Saved VT content
+                    // 3. [Restored] marker
+                    // 4. Startup banners (Last login, Restored session)
+                    let now = Date()
+                    let formatter = DateFormatter()
+                    formatter.dateFormat = "dd.MM.yyyy"
+                    let datePart = formatter.string(from: now)
+                    formatter.dateFormat = "HH:mm:ss"
+                    let timePart = formatter.string(from: now)
+                    let marker = "\u{1b}[33m[Restored \(datePart) at \(timePart)]\u{1b}[0m"
+
+                    var fileContent = "\u{1b}[2J\u{1b}[H"  // clear screen + cursor home
+                    fileContent += content
+                    fileContent += "\r\n\(marker)\r\n"
+                    if let bannerText = banners {
+                        fileContent += bannerText + "\r\n"
+                    }
+
+                    // Write to temp file
+                    let tmpPath = NSTemporaryDirectory() + "ghostty_restore_\(self.id.uuidString).vt"
+                    do {
+                        try fileContent.write(toFile: tmpPath, atomically: true, encoding: .utf8)
+                    } catch {
+                        return
+                    }
+
+                    // Send cat command through pty (space prefix to exclude from shell history)
+                    let cmd = " cat '\(tmpPath)' && rm -f '\(tmpPath)'\r"
+                    cmd.withCString { ptr in
+                        ghostty_surface_text(surface, ptr, UInt(cmd.utf8.count))
+                    }
+                } else {
+                    self.waitForPromptThenReplay(content, attempt: attempt + 1)
+                }
+            }
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -1737,6 +1890,16 @@ extension Ghostty {
             config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
+            let scrollbackContent = try container.decodeIfPresent(String.self, forKey: .scrollbackContent)
+
+            // Set TERM_SESSION_ID for restored sessions.
+            if let uuid = uuid {
+                config.environmentVariables["TERM_SESSION_ID"] = uuid.uuidString
+            }
+
+            // Mark this as a restored session so shell integration scripts
+            // can adjust behavior (e.g., suppress login messages).
+            config.environmentVariables["GHOSTTY_RESTORED_SESSION"] = "1"
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -1748,6 +1911,11 @@ extension Ghostty {
                     self.titleFromTerminal = title
                 }
             }
+
+            // Restore scrollback content after the shell's first prompt appears.
+            if let content = scrollbackContent, !content.isEmpty {
+                self.waitForPromptThenReplay(content)
+            }
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1756,6 +1924,7 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
+            try container.encode(readScreenContentVT(), forKey: .scrollbackContent)
         }
     }
 }

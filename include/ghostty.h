@@ -1123,6 +1123,9 @@ bool ghostty_surface_read_text(ghostty_surface_t,
                                ghostty_selection_s,
                                ghostty_text_s*);
 void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+bool ghostty_surface_dump_vt_screen(ghostty_surface_t, ghostty_text_s*);
+void ghostty_surface_replay_vt(ghostty_surface_t, const char*, uintptr_t);
+bool ghostty_surface_cursor_at_prompt(ghostty_surface_t);
 
 #ifdef __APPLE__
 void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
