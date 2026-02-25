@@ -585,6 +585,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Call this last in case it uses any of the properties above.
         window.syncAppearance(surfaceConfig)
+
+        (window.contentView as? TerminalStyleResponder)?
+            .ghosttyConfigurationDidChange(ghostty.config, sender: self)
     }
 
     /// Adjusts the given frame for the configured window position.
@@ -1148,6 +1151,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.windowDidBecomeKey(notification)
         self.relabelTabs()
         self.fixTabBar()
+        (window?.contentView as? TerminalStyleResponder)?
+            .keyWindowStatusDidChange(true, sender: self)
+    }
+
+    override func windowDidResignKey(_ notification: Notification) {
+        super.windowDidResignKey(notification)
+        (window?.contentView as? TerminalStyleResponder)?
+            .keyWindowStatusDidChange(false, sender: self)
     }
 
     override func windowDidMove(_ notification: Notification) {
@@ -1625,4 +1636,14 @@ extension TerminalController {
             return nil
         }
     }
+}
+
+// MARK: - TerminalStyleProvider
+
+extension TerminalController: TerminalStyleProvider {
+    var preferredBackgroundColor: OSColor? {
+        (window as? TerminalWindow)?.preferredBackgroundColor
+    }
+
+    var cornerRadius: CGFloat? { window?.defaultCornerRadius }
 }

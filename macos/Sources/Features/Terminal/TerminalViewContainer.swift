@@ -11,7 +11,7 @@ class TerminalViewContainer<ViewModel: TerminalViewModel>: NSView {
     private var derivedConfig: DerivedConfig?
 
     init(ghostty: Ghostty.App, viewModel: ViewModel, delegate: (any TerminalViewDelegate)? = nil) {
-        self.derivedConfig = DerivedConfig(config: ghostty.config, preferredBackgroundColor: nil, cornerRadius: nil)
+        self.derivedConfig = DerivedConfig(config: ghostty.config, styleProvider: nil)
         self.terminalView = NSHostingView(rootView: TerminalView(
             ghostty: ghostty,
             viewModel: viewModel,
@@ -24,10 +24,6 @@ class TerminalViewContainer<ViewModel: TerminalViewModel>: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
     }
 
     /// To make ``TerminalController/DefaultSize/contentIntrinsicSize``
@@ -46,27 +42,6 @@ class TerminalViewContainer<ViewModel: TerminalViewModel>: NSView {
             terminalView.bottomAnchor.constraint(equalTo: bottomAnchor),
             terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(ghosttyConfigDidChange(_:)),
-            name: .ghosttyConfigDidChange,
-            object: nil
-        )
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidBecomeKey(_:)),
-            name: NSWindow.didBecomeKeyNotification,
-            object: nil
-        )
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidResignKey(_:)),
-            name: NSWindow.didResignKeyNotification,
-            object: nil
-        )
     }
 
     override func viewDidMoveToWindow() {
@@ -79,27 +54,18 @@ class TerminalViewContainer<ViewModel: TerminalViewModel>: NSView {
         super.layout()
         updateGlassEffectTopInsetIfNeeded()
     }
+}
 
-    @objc private func ghosttyConfigDidChange(_ notification: Notification) {
-        guard let config = notification.userInfo?[
-            Notification.Name.GhosttyConfigChangeKey
-        ] as? Ghostty.Config else { return }
-        let newValue = DerivedConfig(config: config, preferredBackgroundColor: (window as? TerminalWindow)?.preferredBackgroundColor, cornerRadius: window?.defaultCornerRadius)
+extension TerminalViewContainer: TerminalStyleResponder {
+    func ghosttyConfigurationDidChange(_ config: Ghostty.Config, sender: Any?) {
+        let newValue = DerivedConfig(config: config, styleProvider: sender as? TerminalStyleProvider)
         guard newValue != derivedConfig else { return }
         derivedConfig = newValue
-        DispatchQueue.main.async(execute: updateGlassEffectIfNeeded)
+        updateGlassEffectIfNeeded()
     }
 
-    @objc private func windowDidBecomeKey(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              window == self.window else { return }
-        updateGlassTintOverlay(isKeyWindow: true)
-    }
-
-    @objc private func windowDidResignKey(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow,
-              window == self.window else { return }
-        updateGlassTintOverlay(isKeyWindow: false)
+    func keyWindowStatusDidChange(_ isKeyWindow: Bool, sender: Any?) {
+        updateGlassTintOverlay(isKeyWindow: isKeyWindow, styleProvider: sender as? TerminalStyleProvider)
     }
 }
 
@@ -192,6 +158,7 @@ private class TerminalGlassView: NSView {
         return (vibrant, overlayOpacity)
     }
 }
+
 #endif // compiler(>=6.2)
 
 private extension TerminalViewContainer {
@@ -244,8 +211,7 @@ private extension TerminalViewContainer {
         guard
             #available(macOS 26.0, *),
             let effectView = glassEffectView as? TerminalGlassView,
-            let themeFrameView = window?.contentView?.superview,
-            let derivedConfig
+            let themeFrameView = window?.contentView?.superview
         else {
             return
         }
@@ -253,7 +219,7 @@ private extension TerminalViewContainer {
 #endif // compiler(>=6.2)
     }
 
-    func updateGlassTintOverlay(isKeyWindow: Bool) {
+    func updateGlassTintOverlay(isKeyWindow: Bool, styleProvider: TerminalStyleProvider?) {
 #if compiler(>=6.2)
         guard
             #available(macOS 26.0, *),
@@ -272,7 +238,7 @@ private extension TerminalViewContainer {
         let backgroundOpacity: Double
         let cornerRadius: CGFloat?
 
-        init?(config: Ghostty.Config, preferredBackgroundColor: NSColor?, cornerRadius: CGFloat?) {
+        init?(config: Ghostty.Config, styleProvider: TerminalStyleProvider?) {
             switch config.backgroundBlur {
             case .macosGlassRegular:
                 style = .regular
@@ -281,9 +247,9 @@ private extension TerminalViewContainer {
             default:
                 return nil
             }
-            self.backgroundColor = preferredBackgroundColor ?? NSColor(config.backgroundColor)
+            self.backgroundColor = styleProvider?.preferredBackgroundColor ?? NSColor(config.backgroundColor)
             self.backgroundOpacity = config.backgroundOpacity
-            self.cornerRadius = cornerRadius
+            self.cornerRadius = styleProvider?.cornerRadius
         }
     }
 }

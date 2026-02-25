@@ -161,6 +161,9 @@ class QuickTerminalController: BaseTerminalController {
         // applies if we can be seen.
         guard visible else { return }
 
+        (window?.contentView as? TerminalStyleResponder)?
+            .keyWindowStatusDidChange(true, sender: self)
+
         // Re-hide the dock if we were hiding it before.
         hiddenDock?.hide()
     }
@@ -173,6 +176,9 @@ class QuickTerminalController: BaseTerminalController {
         // windowDidResignKey will also get called after animateOut so this
         // ensures we don't run logic twice.
         guard visible else { return }
+
+        (window?.contentView as? TerminalStyleResponder)?
+            .keyWindowStatusDidChange(false, sender: self)
 
         // We don't animate out if there is a modal sheet being shown currently.
         // This lets us show alerts without causing the window to disappear.
@@ -706,6 +712,9 @@ class QuickTerminalController: BaseTerminalController {
         self.derivedConfig = DerivedConfig(config)
 
         syncAppearance()
+
+        (window?.contentView as? TerminalStyleResponder)?
+            .ghosttyConfigurationDidChange(config, sender: self)
     }
 
     @objc private func onNewTab(notification: SwiftUI.Notification) {
@@ -774,6 +783,14 @@ class QuickTerminalController: BaseTerminalController {
             hidden = false
         }
     }
+}
+
+// MARK: - TerminalStyleProvider
+
+extension QuickTerminalController: TerminalStyleProvider {
+    var preferredBackgroundColor: OSColor? { nil }
+
+    var cornerRadius: CGFloat? { window?.defaultCornerRadius }
 }
 
 extension Notification.Name {
